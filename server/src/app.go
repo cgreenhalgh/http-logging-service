@@ -3,8 +3,8 @@ package main
 import (
     "encoding/json"
     "errors"
-    "fmt"
     "io"
+    "fmt"
     "net/http"
     "log"
     "strings"
@@ -27,12 +27,35 @@ type LoglevelItems struct {
     Logs []LoglevelItem `json:"logs"`
 }
 
+// internal
+type LogResponse struct {
+    Message string
+    Code int
+}
+
+type LogRequest struct {
+    Appname string
+    Token string
+    Items []LoglevelItem
+    Done  chan LogResponse
+}
+
+// all requests - FE to BE (sync)
+var requests = make(chan LogRequest)
+
+// config for a logger
+type LoggerConfig struct {
+    App string `json:"app"`
+    Dir string `json:"dir"`
+    Secret string `json:"secret"`
+}
 
 var debug = true
 
 func main() {
     http.HandleFunc("/loglevel/", HandleLoglevelRequest)
     http.HandleFunc("/", HandleRootRequest)
+    go requestHandler()
     log.Print("Running on :8080")
     log.Fatal(http.ListenAndServe(":8080", nil))
 }
@@ -135,6 +158,64 @@ func HandleLoglevelRequest(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    fmt.Fprintf(w, "Log, %d items", len(ls.Logs))
+    // reply channel - message and http status
+    done := make(chan LogResponse)
+    req := LogRequest{
+         Appname: appname,
+         Token: authtoken,
+         Items: ls.Logs,
+         Done: done,
+    }
+    requests <- req
+    res := <-done
+    if res.Code == http.StatusOK {
+        fmt.Fprint(w, res.Message);
+    } else {
+        ReturnError(w, r, res.Message, res.Code)
+    }
+}
+
+// Logger type / internal data
+type Logger struct{
+    Appname string
+    Exists bool
+    Token string
+    // TODO
+    Requests chan LogRequest
+}
+
+// call only once as go routine!
+func requestHandler() {
+    loggers := make(map[string]*Logger)
+
+    for true  {
+        req := <-requests
+
+        logger := loggers[req.Appname]
+        if logger == nil {
+            log.Printf("Create logger %s\n", req.Appname)
+            logger = new(Logger)
+            logger.Appname = req.Appname
+            logger.Exists = true // TODO
+            logger.Requests = make(chan LogRequest)
+            go loggerHandler(logger)
+            loggers[req.Appname] = logger
+        }
+        logger.Requests <- req
+    }
+}
+// one per logger only
+func loggerHandler(logger *Logger) {
+    for true {
+        req := <-logger.Requests
+
+        log.Printf("Log %s: %d items\n", req.Appname, len(req.Items))
+
+        // TODO
+        req.Done <- LogResponse{
+            Message:"OK",
+            Code: http.StatusOK,
+        }
+    }
 }
 
