@@ -1,0 +1,88 @@
+<html>
+<head>
+<title>Test loglevel</title>
+</head>
+<body>
+<h1>Test loglevel</h1>
+<script src="loglevel.min.js"></script>
+<script src="loglevel-plugin-remote.min.js"></script>
+
+<script>
+// https://stackoverflow.com/questions/105034/how-to-create-guid-uuid
+function uuidv4() {
+  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+    (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
+  );
+}
+// unique logging ID for this session/window
+var uuid = uuidv4();
+console.log('my uuid: '+uuid);
+function format(log) {
+  log.level = log.level.label;
+  log.windowid = uuid;
+  return log;
+}
+// enable remote logging
+remote.apply(log, {
+  format: format,
+  url: "/3/loglevel/strap",
+  // fix me
+  token: "INSERT-BEARER-TOKEN-FOR-LOGGER"
+});
+// monitor visible/hidden
+function monitorVisible() {
+        //https://stackoverflow.com/questions/1060008/is-there-a-way-to-detect-if-a-browser-window-is-not-currently-active
+        let hidden = "hidden";
+            
+        function onchange(evt) {
+            let v = "visible", h = "hidden",
+                evtMap = {
+                    focus: v, focusin: v, pageshow: v, blur: h, focusout: h, pagehide: h
+                };
+
+            evt = evt || window.event;
+            let res = null;
+            if (evt.type in evtMap)
+                res = evtMap[evt.type];
+            else
+                res = this[hidden] ? "hidden" : "visible";
+
+            console.log('visible?? ' + res);
+            if (res == 'visible') {
+                log.info('visible')
+            } else if (res == 'hidden') {
+                log.info('hidden')
+            }
+        }
+        // Standards:
+        if (hidden in document)
+            document.addEventListener("visibilitychange", onchange);
+        else if ((hidden = "mozHidden") in document)
+            document.addEventListener("mozvisibilitychange", onchange);
+        else if ((hidden = "webkitHidden") in document)
+            document.addEventListener("webkitvisibilitychange", onchange);
+        else if ((hidden = "msHidden") in document)
+            document.addEventListener("msvisibilitychange", onchange);
+        // IE 9 and lower:
+        else if ("onfocusin" in document)
+            document.onfocusin = document.onfocusout = onchange;
+        // All others:
+        else
+            window.onfocus = window.onblur = onchange;
+        // and anyway (but don't seem to get to fire usefully on chrome)
+        window.onpageshow = window.onpagehide = onchange
+
+        // set the initial state (but only if browser supports the Page Visibility API)
+        if (document[hidden] !== undefined)
+            onchange({type: this.document[hidden] ? "blur" : "focus"});    
+}
+// log info and above
+log.setLevel("info");
+// check visibility
+monitorVisible();
+// for example...
+log.warn("too easy");
+</script>
+</body>
+</html>
+

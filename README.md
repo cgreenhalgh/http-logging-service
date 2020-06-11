@@ -6,14 +6,14 @@ plan:
 
 - golang http server writing logs
 
-- javascript client - maybe 
+- javascript client - 
 [loglevel](https://github.com/pimterry/loglevel) and 
 [loglevel-plugin-remote](https://github.com/kutuluk/loglevel-plugin-remote)
 
 status:
-- server skeleton
+- v1
 
-## config
+## config - server
 
 server config directory
 
@@ -42,6 +42,22 @@ where each log item is object with:
 need to add client id, say 'windowid'
 
 server adds 'servertime' (in RFC3339 format)
+
+## client
+
+Use 
+[loglevel](https://github.com/pimterry/loglevel) and
+[loglevel-plugin-remote](https://github.com/kutuluk/loglevel-plugin-remote)
+
+For remote.appy use options:
+```
+  format: format,
+  url: "/loglevel/APPLICATION-NAME",
+  token: "INSERT-BEARER-TOKEN-FOR-LOGGER"
+```
+
+For sample client/code see [testclient/testloglevel.html](testclient/testloglevel.html).
+
 
 ## Build
 
