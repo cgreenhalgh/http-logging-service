@@ -15,16 +15,14 @@ status:
 
 ## config
 
-(plan)
-
 server config directory
 
 contains config files
 
 file json encoded object, called `APPNAME.json`:
-- app: string
-- dir: string
-- secret: string
+- app: string (optional)
+- dir: string (optional, defaults to APPNAME)
+- secret: string (required)
 
 ## data format
 
@@ -43,6 +41,8 @@ where each log item is object with:
 
 need to add client id, say 'windowid'
 
+server adds 'servertime' (in RFC3339 format)
+
 ## Build
 
 Server
@@ -58,6 +58,9 @@ sudo docker run --rm -d -p 8080:8080 --name=logging-server \
  --network=internal \
  logging-server
 sudo docker exec -it logging-server /bin/sh
+```
+test
+```
 curl -v -X POST -H "Authorization: Bearer 123" \
   -H "Content-type: application/json" \
   --data '{"logs":[{"message":"hello"}]}' \

@@ -4,10 +4,14 @@ import (
     "encoding/json"
     "errors"
     "io"
+    "io/ioutil"
     "fmt"
-    "net/http"
     "log"
+    "net/http"
+    "os"
+    "path/filepath"
     "strings"
+    "time"
 
     "github.com/golang/gddo/httputil/header"
 )
@@ -20,6 +24,7 @@ type LoglevelItem struct {
     Timestamp string `json:"timestamp"`
     Stacktrace string `json:"stacktrace"`
     Windowid string `json:"windowid"`
+    ServerTime string `json:"servertime"`
 }
 
 // loglevel logs (posted)
@@ -50,9 +55,29 @@ type LoggerConfig struct {
     Secret string `json:"secret"`
 }
 
-var debug = true
+var debug = false
+var logdir string
+var confdir string
+const LOGPATH = "logs"
+const CONFPATH = "conf"
 
 func main() {
+    cwd, err := os.Getwd()
+    if err != nil {
+        log.Fatal(err)
+    }
+    logdir = filepath.Join(cwd, LOGPATH)
+    confdir = filepath.Join(cwd, CONFPATH)
+    _, err = ioutil.ReadDir(logdir)
+    if err != nil {
+        log.Fatalf("Cannot read log dir %s: %s", logdir, err)
+    }
+    _,err = ioutil.ReadDir(confdir)
+    if err != nil {
+        log.Fatalf("Cannot read config dir %s: %s", confdir, err)
+    }
+    log.Printf("Log to %s, config in %s", logdir, confdir)
+
     http.HandleFunc("/loglevel/", HandleLoglevelRequest)
     http.HandleFunc("/", HandleRootRequest)
     go requestHandler()
@@ -178,10 +203,17 @@ func HandleLoglevelRequest(w http.ResponseWriter, r *http.Request) {
 // Logger type / internal data
 type Logger struct{
     Appname string
-    Exists bool
     Token string
-    // TODO
     Requests chan LogRequest
+    Configured bool
+    ConfigLastCheck time.Time
+    ConfigFile string
+    Config LoggerConfig
+    Logdir string
+    CreateLast time.Time
+    WriteLast time.Time
+    NeedsFlush bool
+    LogFile *os.File
 }
 
 // call only once as go routine!
@@ -196,7 +228,6 @@ func requestHandler() {
             log.Printf("Create logger %s\n", req.Appname)
             logger = new(Logger)
             logger.Appname = req.Appname
-            logger.Exists = true // TODO
             logger.Requests = make(chan LogRequest)
             go loggerHandler(logger)
             loggers[req.Appname] = logger
@@ -204,18 +235,150 @@ func requestHandler() {
         logger.Requests <- req
     }
 }
+
+// 1 minute
+const CACHE_CONFIG_HOURS = 1.0/60 // 1 minute
+const FLUSH_HOURS = 1.0/60/2 // 30 seconds
+const ROTATE_HOURS = 24.0
+// RFC3339 with ms accuracy
+const RFC3339MS = "2006-01-02T15:04:05.000Z07:00"
+
 // one per logger only
 func loggerHandler(logger *Logger) {
     for true {
+        // TODO call HandleRequest with no items to force sync/close
         req := <-logger.Requests
 
-        log.Printf("Log %s: %d items\n", req.Appname, len(req.Items))
-
-        // TODO
-        req.Done <- LogResponse{
-            Message:"OK",
-            Code: http.StatusOK,
+        if debug {
+            log.Printf("Log %s: %d items\n", req.Appname, len(req.Items))
         }
+        msg,code := logger.HandleRequest(req)
+        req.Done <- LogResponse{
+            Message:msg,
+            Code: code,
+        }
+    }
+}
+func (this *Logger) HandleRequest(req LogRequest) (string,int) {
+    now := time.Now()
+    // read or update Config; check Logdir exists
+    if this.ConfigLastCheck.IsZero() ||
+       now.Sub(this.ConfigLastCheck).Hours() > CACHE_CONFIG_HOURS {
+        this.ConfigFile = filepath.Join(confdir, req.Appname+".json")
+        if debug {
+            log.Printf("(Re)Read config %s", this.ConfigFile)
+        }
+        this.ConfigLastCheck = now
+        rawconfig,err := ioutil.ReadFile(this.ConfigFile)
+        if err != nil {
+            log.Printf("Error reading config %s for %s: %s", this.ConfigFile, req.Appname, err)
+            this.Configured = false
+        } else {
+            var newConfig LoggerConfig
+            err = json.Unmarshal(rawconfig, &newConfig)
+            if err != nil {
+                log.Printf("Error parsing config %s for %s: %s", this.ConfigFile, req.Appname, err)
+                this.Configured = false
+            } else {
+                if debug {
+                    log.Printf("Config for %s: dir %s", req.Appname, newConfig.Dir)
+                }
+                if newConfig.Dir == "" {
+                    newConfig.Dir = req.Appname
+                }
+                this.Configured = true
+                if newConfig.Dir != this.Config.Dir {
+                    // close
+                    this.CloseLogFile()
+                    log.Printf("Set log dir %s for %s", newConfig.Dir, req.Appname)
+                    this.Logdir =  filepath.Join(logdir, newConfig.Dir)
+                    linfo,err := os.Stat(this.Logdir)
+                    if err != nil && os.IsNotExist(err) {
+                        err = os.Mkdir(this.Logdir, 0775)
+                        if err != nil {
+                            log.Printf("Could not create new log dir %s for %s: %s", this.Logdir, req.Appname, err)
+                            this.Configured = false
+                        }
+                        log.Printf("Created log dir %s for %s", this.Logdir, req.Appname)
+                    } else if err != nil {
+                        log.Printf("Problem with log dir %s for %s: %s", this.Logdir, req.Appname, err)
+                        this.Configured = false
+                    } else if ! linfo.IsDir() {
+                        log.Printf("Log dir %s for %s is not a directory", this.Logdir, req.Appname)
+                        this.Configured = false
+                    }
+                }
+                this.Config = newConfig
+            }
+        }
+    }
+    if  ! this.Configured {
+        return "Logger not configured", http.StatusNotFound
+    }
+    if req.Token != this.Config.Secret {
+        log.Printf("invalid token for log %s", req.Appname)
+        return "Invalid token", http.StatusUnauthorized
+    }
+    if this.LogFile != nil && now.Sub(this.CreateLast).Hours() > ROTATE_HOURS {
+        this.CloseLogFile()
+    }
+    if this.LogFile != nil && this.NeedsFlush && now.Sub(this.WriteLast).Hours() > FLUSH_HOURS {
+        err := this.LogFile.Sync()
+        if err != nil {
+            // trigger reopen
+            this.CloseLogFile()
+        }
+        this.NeedsFlush = false
+    }
+    // null write
+    if len(req.Items) == 0 {
+        return "OK",http.StatusOK
+    }
+
+    if this.LogFile == nil {
+        filename := now.UTC().Format(time.RFC3339) + ".log"
+        path := filepath.Join(this.Logdir, filename)
+        log.Printf("New log file %s for %s", path, this.Appname)
+        file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0755)
+        if err != nil {
+            log.Printf("Error opening log %s: %s", path, err)
+            this.LogFile = nil
+            return "Could not create logfile", http.StatusInternalServerError
+        }
+        this.LogFile = file
+        this.CreateLast = now
+    }
+    for i:= 0; i<len( req.Items ); i++ {
+        req.Items[i].ServerTime = now.UTC().Format(RFC3339MS)
+        buf,err := json.Marshal( req.Items[i] )
+        if err != nil {
+            log.Printf("Error marshalling log item: %s", err)
+            return "Error marshalling log item", http.StatusInternalServerError
+        }
+        _,err = this.LogFile.Write(buf)
+       if err != nil {
+           log.Printf("Error writing log item: %s", err)
+           this.CloseLogFile()
+           return "Error writing log item", http.StatusInternalServerError
+       }
+
+       _,_ = this.LogFile.Write([]byte("\n"))
+    }
+
+    return "OK",http.StatusOK
+}
+
+func (this *Logger) CloseLogFile() {
+    if this.LogFile != nil {
+        err := this.LogFile.Sync()
+        if err != nil {
+            log.Printf("Error syncing logfile for %s: %s", this.Appname, err)
+        }
+        err = this.LogFile.Close()
+        if err != nil {
+            log.Printf("Error closing logfile for %s: %s", this.Appname, err)
+        }
+        this.LogFile = nil
     }
 }
 
