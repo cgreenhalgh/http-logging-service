@@ -95,33 +95,38 @@ func ReturnError(w http.ResponseWriter, r *http.Request, message string, code in
 
 // Request in Loglevel format
 func HandleLoglevelRequest(w http.ResponseWriter, r *http.Request) {
+    // limit size = 10MB
+    r.Body = http.MaxBytesReader(w, r.Body, 1048576*10)
+
+    message,code := getLoglevelResponse(r)
+    if code == http.StatusOK {
+        fmt.Fprint(w, message);
+    } else {
+        ReturnError(w, r, message, code)
+    }
+}
+func getLoglevelResponse(r *http.Request) (string,int) {
     if r.Method != http.MethodPost {
-        ReturnError(w, r, "log accepts POST only", http.StatusMethodNotAllowed)
-        return
+        return "log accepts POST only", http.StatusMethodNotAllowed
     }
     mimetype, _ := header.ParseValueAndParams(r.Header, "Content-Type")
     if mimetype != "application/json" {
-        ReturnError(w, r, "Send me JSON!", http.StatusUnsupportedMediaType)
-        return
+        return "Send me JSON!", http.StatusUnsupportedMediaType
     }
     auth := r.Header.Get("Authorization")
     if len(auth) < 7 || auth[0:7] != "Bearer " {
-        ReturnError(w, r, "Missing/non-bearer authorization", http.StatusUnauthorized)
-        return
+        return "Missing/non-bearer authorization", http.StatusUnauthorized
     }
     authtoken := auth[7:]
     appname := r.URL.Path[10:] // /loglevel/...
     slix := strings.Index(appname,"/")
     if slix > -1 || len(appname) == 0 {
-        ReturnError(w, r, "Invalid/missing app name", http.StatusNotFound)
-        return
+        return "Invalid/missing app name", http.StatusNotFound
     }
     if debug {
         log.Printf("POST %s (token %s)", appname, authtoken)
     }
     // with help from https://www.alexedwards.net/blog/how-to-properly-parse-a-json-request-body
-    // limit size = 10MB
-    r.Body = http.MaxBytesReader(w, r.Body, 1048576*10) 
     dec := json.NewDecoder(r.Body)
     // disallow additional fields
     dec.DisallowUnknownFields()
@@ -135,42 +140,41 @@ func HandleLoglevelRequest(w http.ResponseWriter, r *http.Request) {
         switch {
         // Catch any syntax errors in the JSON
         case errors.As(err, &syntaxError):
-            ReturnError(w, r, "badly formed JSON", http.StatusBadRequest)
+            return "badly formed JSON", http.StatusBadRequest
 
         // In some circumstances Decode() may also return an
         // io.ErrUnexpectedEOF error for syntax errors in the JSON. There
         // is an open issue regarding this at
         // https://github.com/golang/go/issues/25956.
         case errors.Is(err, io.ErrUnexpectedEOF):
-            ReturnError(w, r, "badly formed JSON", http.StatusBadRequest)
+            return "badly formed JSON", http.StatusBadRequest
 
         // Catch any type errors
         case errors.As(err, &unmarshalTypeError):
-            ReturnError(w, r, "JSON type error", http.StatusBadRequest)
+            return "JSON type error", http.StatusBadRequest
 
         // Catch the error caused by extra unexpected fields in the request
         // body. 
         case strings.HasPrefix(err.Error(), "json: unknown field "):
-            ReturnError(w, r, "JSON with unknown fields", http.StatusBadRequest)
+            return "JSON with unknown fields", http.StatusBadRequest
 
         // An io.EOF error is returned by Decode() if the request body is
         // empty.
         case errors.Is(err, io.EOF):
-            ReturnError(w, r, "Empty request", http.StatusBadRequest)
+            return "Empty request", http.StatusBadRequest
 
         // Catch the error caused by the request body being too large. Again
         // there is an open issue regarding turning this into a sentinel
         // error at https://github.com/golang/go/issues/30715.
         case err.Error() == "http: request body too large":
-            ReturnError(w, r, "Request too large", http.StatusRequestEntityTooLarge)
+            return "Request too large", http.StatusRequestEntityTooLarge
 
         // Otherwise default to logging the error and sending a 500 Internal
         // Server Error response.
         default:
             log.Println(err.Error())
-            ReturnError(w, r, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+            return http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError
         }
-        return
     }
 
     // Call decode again, using a pointer to an empty anonymous struct as 
@@ -179,8 +183,7 @@ func HandleLoglevelRequest(w http.ResponseWriter, r *http.Request) {
     // we know that there is additional data in the request body.
     err = dec.Decode(&struct{}{})
     if err != io.EOF {
-        ReturnError(w, r, "Extra data after body", http.StatusBadRequest)
-        return
+        return "Extra data after body", http.StatusBadRequest
     }
 
     // reply channel - message and http status
@@ -193,11 +196,7 @@ func HandleLoglevelRequest(w http.ResponseWriter, r *http.Request) {
     }
     requests <- req
     res := <-done
-    if res.Code == http.StatusOK {
-        fmt.Fprint(w, res.Message);
-    } else {
-        ReturnError(w, r, res.Message, res.Code)
-    }
+    return res.Message, res.Code
 }
 
 // Logger type / internal data
@@ -215,6 +214,9 @@ type Logger struct{
     NeedsFlush bool
     LogFile *os.File
 }
+// don't force dispatch thread to wait for back-end logger thread
+// (most of the time)
+const REQUEST_BUFFER_SIZE = 100
 
 // call only once as go routine!
 func requestHandler() {
@@ -228,7 +230,7 @@ func requestHandler() {
             log.Printf("Create logger %s\n", req.Appname)
             logger = new(Logger)
             logger.Appname = req.Appname
-            logger.Requests = make(chan LogRequest)
+            logger.Requests = make(chan LogRequest, REQUEST_BUFFER_SIZE)
             go loggerHandler(logger)
             loggers[req.Appname] = logger
         }
@@ -246,7 +248,7 @@ const RFC3339MS = "2006-01-02T15:04:05.000Z07:00"
 // one per logger only
 func loggerHandler(logger *Logger) {
     for true {
-        // TODO call HandleRequest with no items to force sync/close
+        // TODO call HandleRequest after a time with no items to force sync/close
         req := <-logger.Requests
 
         if debug {
@@ -364,7 +366,10 @@ func (this *Logger) HandleRequest(req LogRequest) (string,int) {
 
        _,_ = this.LogFile.Write([]byte("\n"))
     }
-
+    if ! this.NeedsFlush {
+        this.NeedsFlush = true
+        this.WriteLast = now
+    }
     return "OK",http.StatusOK
 }
 
